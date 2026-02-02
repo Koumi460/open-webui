@@ -50,6 +50,7 @@
 		copyToClipboard,
 		getMessageContentParts,
 		createMessagesList,
+		processDetailsAndExtractToolCalls,
 		getPromptVariables,
 		processDetails,
 		removeAllDetails,
@@ -1891,42 +1892,128 @@
 						role: 'system',
 						content: `${params?.system ?? $settings?.system ?? ''}`
 					}
-				: undefined,
-			..._messages.map((message) => ({
-				...message,
-				content: processDetails(message.content)
-			}))
+				: undefined
 		].filter((message) => message);
 
-		messages = messages
-			.map((message, idx, arr) => {
-				const imageFiles = (message?.files ?? []).filter(
-					(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
-				);
+		// Process each message and extract tool calls
+		for (const message of _messages) {
+			let content = message?.merged?.content ?? message?.content;
+			content = message?.role !== 'user' ? content?.trim() : content;
+			
+			const imageFiles = (message?.files ?? []).filter(
+				(file) => file.type === 'image' || (file?.content_type ?? '').startsWith('image/')
+			);
 
-				return {
-					role: message.role,
-					...(message.role === 'user' && imageFiles.length > 0
-						? {
-								content: [
-									{
-										type: 'text',
-										text: message?.merged?.content ?? message.content
-									},
-									...imageFiles.map((file) => ({
-										type: 'image_url',
-										image_url: {
-											url: file.url
-										}
-									}))
-								]
+			if (message?.role === 'user') {
+				// User message - handle images
+				if (imageFiles.length > 0) {
+					messages.push({
+						role: 'user',
+						content: [
+							{
+								type: 'text',
+								text: content
+							},
+							...imageFiles.map((file) => ({
+								type: 'image_url',
+								image_url: {
+									url: file.url
+								}
+							}))
+						]
+					});
+				} else {
+					messages.push({
+						role: 'user',
+						content: content
+					});
+				}
+			} else {
+				// Assistant message - process tool calls
+				const processedMessages = processDetailsAndExtractToolCalls(content ?? '');
+				
+				let currentAssistantMessage = null;
+				let toolCallIndex = 0;
+				let pendingToolResults = [];
+
+				for (const processedMessage of processedMessages) {
+					if (typeof processedMessage === 'string') {
+						// Plain text content
+						if (pendingToolResults.length > 0) {
+							// We have pending tool calls - flush them first
+							if (!currentAssistantMessage) {
+								currentAssistantMessage = {
+									role: 'assistant',
+									content: ''
+								};
+								messages.push(currentAssistantMessage);
 							}
-						: {
-								content: message?.merged?.content ?? message.content
-							})
-				};
-			})
-			.filter((message) => message?.role === 'user' || message?.content?.trim());
+							
+							// Add all pending tool result messages
+							messages.push(...pendingToolResults);
+							pendingToolResults = [];
+							
+							// Start new assistant message for continuation
+							currentAssistantMessage = {
+								role: 'assistant',
+								content: processedMessage
+							};
+							messages.push(currentAssistantMessage);
+						} else {
+							// No pending tool calls
+							if (currentAssistantMessage) {
+								// Append to existing assistant message
+								currentAssistantMessage.content += '\n' + processedMessage;
+							} else {
+								// Create new assistant message
+								currentAssistantMessage = {
+									role: 'assistant',
+									content: processedMessage
+								};
+								messages.push(currentAssistantMessage);
+							}
+						}
+					} else {
+						// Tool call object
+						if (!currentAssistantMessage) {
+							// Create assistant message to hold tool calls
+							currentAssistantMessage = {
+								role: 'assistant',
+								content: ''
+							};
+							messages.push(currentAssistantMessage);
+						}
+
+						// Add tool call to current assistant message
+						currentAssistantMessage.tool_calls ??= [];
+						currentAssistantMessage.tool_calls.push({
+							index: toolCallIndex++,
+							id: processedMessage.id,
+							type: 'function',
+							function: {
+								name: processedMessage.name,
+								arguments: processedMessage.arguments
+							}
+						});
+
+						// Queue tool result message (don't add yet - collect all tool calls first)
+						pendingToolResults.push({
+							role: 'tool',
+							tool_call_id: processedMessage.id,
+							content: processedMessage.result
+						});
+					}
+				}
+				
+				// Flush any remaining pending tool results
+				if (pendingToolResults.length > 0) {
+					messages.push(...pendingToolResults);
+				}
+			}
+		}
+
+		// Filter out empty messages
+		messages = messages.filter((message) => message?.role === 'user' || message?.role === 'tool' || message?.content?.trim() || message?.tool_calls);
 
 		const toolIds = [];
 		const toolServerIds = [];

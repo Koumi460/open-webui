@@ -880,6 +880,85 @@ export const processDetails = (content) => {
 	return content;
 };
 
+// Parse message content with <details> tags and split into array of text/tool messages
+export const processDetailsAndExtractToolCalls = (content) => {
+	content = removeDetails(content, ['reasoning', 'code_interpreter']);
+
+	const toolCallsDetailsRegex = /<details\s+type="tool_calls"([^>]*)>([\s\S]*?)<\/details>/gis;
+	const detailsAttributesRegex = /(\w+)="([^"]*)"/g;
+
+	// Split text and tool calls into messages array
+	let messages = [];
+	const matches = content.match(toolCallsDetailsRegex);
+	
+	if (matches && matches.length > 0) {
+		let previousDetailsEndIndex = 0;
+		
+		for (const match of matches) {
+			let detailsStartIndex = content.indexOf(match, previousDetailsEndIndex);
+			let assistantMessage = content.substring(
+				previousDetailsEndIndex,
+				detailsStartIndex
+			);
+			previousDetailsEndIndex = detailsStartIndex + match.length;
+
+			assistantMessage = assistantMessage.trim();
+			if (assistantMessage.length > 0) {
+				messages.push(assistantMessage);
+			}
+
+			const attributes = {};
+			let attributeMatch;
+			detailsAttributesRegex.lastIndex = 0; // Reset regex state
+			while ((attributeMatch = detailsAttributesRegex.exec(match)) !== null) {
+				attributes[attributeMatch[1]] = attributeMatch[2];
+			}
+
+			if (!attributes.id) {
+				continue;
+			}
+
+			let toolCall = {
+				id: attributes.id,
+				name: attributes.name,
+				arguments: unescapeHtml(attributes.arguments ?? ''),
+				result: unescapeHtml(attributes.result ?? '')
+			};
+
+			// Parse double-encoded JSON strings
+			try {
+				let parsedArgs = JSON.parse(toolCall.arguments);
+				if (typeof parsedArgs === 'string') {
+					toolCall.arguments = parsedArgs;
+				}
+			} catch (e) {
+				// Keep original if not valid JSON
+			}
+
+			try {
+				let parsedResult = JSON.parse(toolCall.result);
+				if (typeof parsedResult === 'string') {
+					toolCall.result = parsedResult;
+				}
+			} catch (e) {
+				// Keep original if not valid JSON
+			}
+
+			messages.push(toolCall);
+		}
+
+		let finalAssistantMessage = content.substring(previousDetailsEndIndex);
+		finalAssistantMessage = finalAssistantMessage.trim();
+		if (finalAssistantMessage.length > 0) {
+			messages.push(finalAssistantMessage);
+		}
+	} else if (content.length > 0) {
+		messages.push(content);
+	}
+
+	return messages;
+};
+
 // This regular expression matches code blocks marked by triple backticks
 const codeBlockRegex = /```[\s\S]*?```/g;
 
@@ -1177,6 +1256,7 @@ export const createMessagesList = (history, messageId) => {
 		return [message];
 	}
 };
+
 
 export const formatFileSize = (size) => {
 	if (size == null) return 'Unknown size';
